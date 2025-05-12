@@ -1,4 +1,4 @@
-# train.py (Modified for One-Variable-at-a-Time Evaluation)
+# Simplified train.py for Hyperparameter Evaluation (v2)
 
 import os
 import torch
@@ -7,321 +7,229 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
-# torch.amp for Automatic Mixed Precision
-from torch.amp import autocast, GradScaler 
 
-# --- 0. Prep output folders ---
-# Base plots directory
-plots_dir = "plots_one_var_at_a_time" 
+# --- 0. Setup ---
+plots_dir = "plots_one_var_at_a_time"
+data_dir = "data"
 os.makedirs(plots_dir, exist_ok=True)
-# Data directory
-os.makedirs("data", exist_ok=True)
+os.makedirs(data_dir, exist_ok=True)
 
-# --- 1. Data loaders ---
+# Set device (use GPU if available, otherwise CPU)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# --- 1. Data Preparation ---
 transform = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Lambda(lambda t: t.view(-1))  # flatten 28×28 → 784
+    transforms.Lambda(lambda t: t.view(-1))  # Flatten 28x28 image to 784 vector
 ])
 
-# download if needed
-full_train = datasets.FashionMNIST("data", train=True, download=True, transform=transform)
-train_set, val_set = random_split(full_train, [50_000, 10_000])
-test_set = datasets.FashionMNIST("data", train=False, download=True, transform=transform)
+# Load FashionMNIST dataset (only need training portion for train/val split)
+full_train_dataset = datasets.FashionMNIST(data_dir, train=True, download=True, transform=transform)
 
-# Define device globally so get_loaders can use it
-device = "cuda" if torch.cuda.is_available() else "cpu"
-if device == "cuda":
-    torch.backends.cudnn.benchmark = True # Enable cuDNN benchmark mode
+# Split training data into training and validation sets
+train_dataset, val_dataset = random_split(full_train_dataset, [50_000, 10_000])
 
-def get_loaders(batch_size):
-    num_w = 0
-    pin_mem = False
-    if device == "cuda": 
-        num_w = min(os.cpu_count() or 1, 4) 
-        pin_mem = True
-
-    return (
-        DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_w, pin_memory=pin_mem),
-        DataLoader(val_set,   batch_size=batch_size, num_workers=num_w, pin_memory=pin_mem),
-        DataLoader(test_set,  batch_size=batch_size, num_workers=num_w, pin_memory=pin_mem),
-    )
-
-# --- 2. Flexible MLP definition ---
+# --- 2. Model Definition ---
 class MLP(nn.Module):
+    """A simple Multi-Layer Perceptron model."""
     def __init__(self, input_dim, hidden_layers, output_dim):
         super().__init__()
         layers = []
-        prev = input_dim
-        for h in hidden_layers:
-            layers += [nn.Linear(prev, h), nn.ReLU()]
-            prev = h
-        layers.append(nn.Linear(prev, output_dim))
-        self.net = nn.Sequential(*layers)
+        current_dim = input_dim
+        for hidden_dim in hidden_layers:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            current_dim = hidden_dim
+        layers.append(nn.Linear(current_dim, output_dim))
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x):
-        return self.net(x)
+        return self.network(x)
 
-# --- 3. Training/Eval function (Mostly unchanged from previous version) ---
-def train_and_eval(hidden_layers, lr, bs, loss_fn, epochs=10, current_device="cpu"):
-    train_loader, val_loader, _ = get_loaders(bs) 
-
-    model = MLP(28*28, hidden_layers, 10).to(current_device)
-
-    if int(torch.__version__.split('.')[0]) >= 2 and current_device == "cuda":
-        # print("Attempting to compile model with torch.compile()...") # Optional: uncomment to see compile messages
-        try:
-            model = torch.compile(model)
-            # print("Model compiled successfully.")
-        except Exception as e:
-            print(f"Model compilation failed: {e}") # Keep error message
-
-    optimizer = optim.SGD(model.parameters(), lr=lr)
-
-    scaler = None
-    if current_device == "cuda":
-        scaler = GradScaler() # Use torch.amp.GradScaler
-
+# --- 3. Training and Evaluation Loop ---
+def run_training_session(model, train_loader, val_loader, loss_fn, optimizer, epochs, current_device):
+    """Trains and validates the model for a given number of epochs."""
     history = {
-        "step_train_losses": [], "epoch_train_loss": [], 
-        "train_acc": [], "val_loss": [], "val_acc": []
+        "step_train_losses": [], "epoch_train_loss": [], "train_acc": [],
+        "val_loss": [], "val_acc": []
     }
+    model.to(current_device)
 
-    for e in range(epochs):
+    for epoch in range(epochs):
+        # --- Training Phase ---
         model.train()
-        current_epoch_total_loss, current_epoch_correct, current_epoch_seen = 0, 0, 0
-        for X, y in train_loader:
-            X, y = X.to(current_device), y.to(current_device)
-            optimizer.zero_grad(set_to_none=True)
+        total_train_loss, correct_train, total_train_samples = 0.0, 0, 0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(current_device), labels.to(current_device)
+            outputs = model(inputs)
+            loss = loss_fn(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-            if scaler: 
-                with autocast(device_type='cuda'): 
-                    logits = model(X)
-                    loss = loss_fn(logits, y)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else: 
-                logits = model(X)
-                loss = loss_fn(logits, y)
-                loss.backward()
-                optimizer.step()
-            
             history["step_train_losses"].append(loss.item())
-            current_epoch_total_loss += loss.item() * X.size(0)
-            preds = logits.argmax(dim=1)
-            current_epoch_correct += (preds == y).sum().item()
-            current_epoch_seen += X.size(0)
+            total_train_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs.data, 1)
+            correct_train += (predicted == labels).sum().item()
+            total_train_samples += labels.size(0)
 
-        history["epoch_train_loss"].append(current_epoch_total_loss / current_epoch_seen if current_epoch_seen > 0 else 0)
-        history["train_acc"].append(current_epoch_correct / current_epoch_seen if current_epoch_seen > 0 else 0)
+        avg_epoch_train_loss = total_train_loss / total_train_samples if total_train_samples else 0
+        train_accuracy = correct_train / total_train_samples if total_train_samples else 0
+        history["epoch_train_loss"].append(avg_epoch_train_loss)
+        history["train_acc"].append(train_accuracy)
 
+        # --- Validation Phase ---
         model.eval()
-        current_val_epoch_total_loss, current_val_correct, current_val_seen = 0, 0, 0
+        total_val_loss, correct_val, total_val_samples = 0.0, 0, 0
         with torch.no_grad():
-            for Xv, yv in val_loader:
-                Xv, yv = Xv.to(current_device), yv.to(current_device)
-                if current_device == "cuda" and scaler: 
-                    with autocast(device_type='cuda'):
-                        lv = model(Xv)
-                else:
-                    lv = model(Xv)
-                lval = loss_fn(lv, yv)
-                current_val_epoch_total_loss += lval.item() * Xv.size(0)
-                current_val_correct += (lv.argmax(dim=1) == yv).sum().item()
-                current_val_seen += Xv.size(0)
-        history["val_loss"].append(current_val_epoch_total_loss / current_val_seen if current_val_seen > 0 else 0)
-        history["val_acc"].append(current_val_correct / current_val_seen if current_val_seen > 0 else 0)
+            for inputs_val, labels_val in val_loader:
+                inputs_val, labels_val = inputs_val.to(current_device), labels_val.to(current_device)
+                outputs_val = model(inputs_val)
+                loss_val = loss_fn(outputs_val, labels_val)
+                total_val_loss += loss_val.item() * inputs_val.size(0)
+                _, predicted_val = torch.max(outputs_val.data, 1)
+                correct_val += (predicted_val == labels_val).sum().item()
+                total_val_samples += labels_val.size(0)
 
-        # Only print epoch summary, removed intra-batch print
-        print(f"  Epoch {e+1}/{epochs}  "
-              f"Train loss {history['epoch_train_loss'][-1]:.4f}, acc {history['train_acc'][-1]:.2%}  "
-              f"Val loss {history['val_loss'][-1]:.4f}, acc {history['val_acc'][-1]:.2%}",
-              flush=True)
+        avg_val_loss = total_val_loss / total_val_samples if total_val_samples else 0
+        val_accuracy = correct_val / total_val_samples if total_val_samples else 0
+        history["val_loss"].append(avg_val_loss)
+        history["val_acc"].append(val_accuracy)
+
+        print(f"  Epoch {epoch+1}/{epochs} | Train Loss: {avg_epoch_train_loss:.4f}, Acc: {train_accuracy:.2%} | "
+              f"Val Loss: {avg_val_loss:.4f}, Acc: {val_accuracy:.2%}")
+
     return history
 
-# --- 4. Plotting Helper Function ---
+# --- 4. Plotting Function ---
 def save_plots(history, config, test_category_name, varied_value_str):
-    """ Saves plots for loss and accuracy into category-specific folders. """
-    # Create subdirectory for the test category
+    """Saves plots for loss and accuracy."""
     plot_subdir = os.path.join(plots_dir, test_category_name)
     os.makedirs(plot_subdir, exist_ok=True)
 
-    # Create filesystem-friendly string for hidden layers
-    hl_str = str(config['hidden']).replace(' ','').replace('[','').replace(']','').replace(',','-')
-    if hl_str == '': hl_str = '0' 
-
-    # Create filename incorporating the varied value
+    hl_str = '-'.join(map(str, config['hidden'])) if config['hidden'] else '0'
     plot_filename = os.path.join(plot_subdir, f"plot_{varied_value_str}.png")
+    # Simplified title
+    title_base = f"LR={config['lr']}, BS={config['bs']}, HL={hl_str}, Loss={config['loss_fn_name']}"
 
-    fig, axs = plt.subplots(2, 1, figsize=(10, 12)) 
+    fig, axs = plt.subplots(2, 1, figsize=(10, 10))
 
-    # Subplot 1: Training Loss per Step
-    title_loss = f"Train Loss | LR={config['lr']}, BS={config['bs']}, HL={hl_str}, Loss={config['loss_fn_name']} | Varied: {varied_value_str}"
-    axs[0].plot(history["step_train_losses"], label="Training Loss (per step)", alpha=0.8)
-    axs[0].set_title(title_loss, fontsize=9) # Smaller font for potentially long title
+    # Plot 1: Training Loss per Step
+    axs[0].plot(history["step_train_losses"], label="Training Loss (per step)", alpha=0.9)
+    axs[0].set_title(f"Train Loss | {title_base} | Varied: {varied_value_str}", fontsize=10)
     axs[0].set_xlabel("Training Steps")
     axs[0].set_ylabel("Loss")
     axs[0].legend()
-    axs[0].grid(True)
+    axs[0].grid(True, linestyle='--', alpha=0.6)
 
-    # Subplot 2: Accuracy per Epoch
-    if history["train_acc"] and history["val_acc"]:
-        epochs_range = range(1, len(history["train_acc"]) + 1)
-        axs[1].plot(epochs_range, history["train_acc"], label="Training Accuracy", marker='o')
-        axs[1].plot(epochs_range, history["val_acc"], label="Validation Accuracy", marker='o')
-        title_acc = f"Accuracy | LR={config['lr']}, BS={config['bs']}, HL={hl_str}, Loss={config['loss_fn_name']} | Varied: {varied_value_str}"
-        axs[1].set_title(title_acc, fontsize=9)
-        axs[1].set_xlabel("Epochs")
-        axs[1].set_ylabel("Accuracy")
-        axs[1].legend()
-        axs[1].grid(True)
-    else:
-        axs[1].text(0.5, 0.5, "No accuracy data to plot.", 
-                    horizontalalignment='center', verticalalignment='center', transform=axs[1].transAxes)
-        axs[1].set_title("Accuracy Plot")
+    # Plot 2: Accuracy per Epoch
+    epochs_range = range(1, len(history["train_acc"]) + 1)
+    axs[1].plot(epochs_range, history["train_acc"], label="Training Accuracy", marker='.')
+    axs[1].plot(epochs_range, history["val_acc"], label="Validation Accuracy", marker='.')
+    axs[1].set_title(f"Accuracy | {title_base} | Varied: {varied_value_str}", fontsize=10)
+    axs[1].set_xlabel("Epochs")
+    axs[1].set_ylabel("Accuracy")
+    axs[1].legend()
+    axs[1].grid(True, linestyle='--', alpha=0.6)
+    if history["val_acc"]:
+         min_acc = min(min(history["train_acc"]), min(history["val_acc"]))
+         axs[1].set_ylim(bottom=max(0, min_acc - 0.1), top=1.05)
 
-    plt.tight_layout(pad=3.0) 
+    plt.tight_layout(pad=2.0)
     plt.savefig(plot_filename)
-    plt.close(fig) 
-    print(f"Saved plot to: {plot_filename}")
+    plt.close(fig)
+    print(f"Saved plot: {plot_filename}")
 
-# --- 5. Define Baseline and Test Parameters ---
+# --- 5. Experiment Configuration ---
 
-# Loss functions dictionary (needed for baseline and tests)
-loss_fns = {
-    "CE":  nn.CrossEntropyLoss(),
-    "MSE": lambda logits,y: nn.MSELoss()(torch.softmax(logits, dim=1), nn.functional.one_hot(y, 10).float()),
-    "MAE": lambda logits,y: nn.L1Loss()(torch.softmax(logits, dim=1), nn.functional.one_hot(y, 10).float())
+loss_functions = {
+    "CE": nn.CrossEntropyLoss(),
+    "MSE": lambda logits, labels: nn.MSELoss()(torch.softmax(logits, dim=1), nn.functional.one_hot(labels, num_classes=10).float()),
+    "MAE": lambda logits, labels: nn.L1Loss()(torch.softmax(logits, dim=1), nn.functional.one_hot(labels, num_classes=10).float())
 }
 
-# Baseline Configuration
-baseline_config = {
-    "lr": 1e-2,          # 0.01
-    "bs": 32,
-    "hidden": [128],     # Single hidden layer with 128 neurons
-    "loss_fn_name": "CE",
-}
-# Add the actual loss function to the baseline dict
-baseline_config["loss_fn"] = loss_fns[baseline_config["loss_fn_name"]]
+baseline_config = { "lr": 0.01, "bs": 32, "hidden": [128], "loss_fn_name": "CE" }
 
-# Parameter ranges to test individually
-learning_rates_to_test = [1e-1, 1e-2, 1e-3]
+learning_rates_to_test = [0.1, 0.01, 0.001]
 batch_sizes_to_test = [1, 32, 256]
-hidden_configs_to_test = [[], [128], [256, 128]] # 0, 1, and 2 hidden layers
-loss_fns_to_test = ["CE", "MSE", "MAE"] # Test based on names
+hidden_configs_to_test = [[], [128], [256, 128]]
+loss_fn_names_to_test = ["CE", "MSE", "MAE"]
+
+EPOCHS_PER_RUN = 10
 
 # --- 6. Run Experiments ---
 
-print(f"Running experiments on device: {device}")
-EPOCHS_PER_CONFIG = 10 # Set number of epochs for all runs
+all_results = {} # Stores history { "Category": [ {param: val, history: hist}, ... ], ... }
 
-# Store results (optional, mainly for programmatic analysis later)
-all_results = {} 
+# Function to run a single experiment configuration
+def run_experiment(config, category_name, varied_param_str):
+    print(f"\n--- Running {category_name}: {varied_param_str} ---")
+    print(f"Config: {config}")
+
+    # Create DataLoaders directly here
+    train_loader = DataLoader(train_dataset, batch_size=config['bs'], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['bs'])
+
+    model = MLP(input_dim=28*28, hidden_layers=config['hidden'], output_dim=10)
+    loss_fn = loss_functions[config['loss_fn_name']]
+    optimizer = optim.SGD(model.parameters(), lr=config['lr'])
+
+    history = run_training_session(model, train_loader, val_loader, loss_fn, optimizer, EPOCHS_PER_RUN, device)
+    save_plots(history, config, category_name, varied_param_str)
+    return history
 
 # --- Run Baseline ---
-print(f"\n--- Running Baseline Configuration ---")
-print(f"Config: {baseline_config}")
-baseline_history = train_and_eval(
-    hidden_layers=baseline_config["hidden"],
-    lr=baseline_config["lr"],
-    bs=baseline_config["bs"],
-    loss_fn=baseline_config["loss_fn"],
-    epochs=EPOCHS_PER_CONFIG,
-    current_device=device
-)
-save_plots(baseline_history, baseline_config, "Baseline", "Baseline")
+baseline_history = run_experiment(baseline_config, "Baseline", "Baseline")
 all_results["Baseline"] = {"config": baseline_config, "history": baseline_history}
 
-# --- Test Learning Rates ---
-print("\n\n--- Testing Learning Rates (Baseline BS, HL, Loss) ---")
-all_results["LR_Test"] = []
-for lr_test in learning_rates_to_test:
-    # Skip if this is the same as baseline to avoid re-running
-    if lr_test == baseline_config["lr"] and "Baseline" in all_results:
-         print(f"\nSkipping LR={lr_test} (same as baseline)")
-         # Optionally copy baseline results if needed for comparison format
-         all_results["LR_Test"].append({"lr": lr_test, "history": baseline_history})
-         continue
+# --- Test Loop Function ---
+def run_test_series(param_name, values_to_test, baseline_value, category_name_prefix):
+    results_list = []
+    category_name = f"{category_name_prefix}_Test" # Define category name once
 
-    current_config = baseline_config.copy()
-    current_config["lr"] = lr_test
-    print(f"\nTesting LR={lr_test}")
-    history = train_and_eval(current_config["hidden"], lr_test, current_config["bs"], current_config["loss_fn"], epochs=EPOCHS_PER_CONFIG, current_device=device)
-    save_plots(history, current_config, "LR_Test", f"LR_{lr_test}")
-    all_results["LR_Test"].append({ "lr": lr_test, "history": history })
+    for test_value in values_to_test:
+        if test_value == baseline_value:
+            print(f"\nSkipping {param_name}={test_value} (same as baseline)")
+            # Store baseline history directly for summary later
+            results_list.append({param_name: test_value, "history": baseline_history, "is_baseline": True})
+            continue
 
-# --- Test Batch Sizes ---
-print("\n\n--- Testing Batch Sizes (Baseline LR, HL, Loss) ---")
-all_results["BS_Test"] = []
-for bs_test in batch_sizes_to_test:
-    if bs_test == baseline_config["bs"] and "Baseline" in all_results:
-         print(f"\nSkipping BS={bs_test} (same as baseline)")
-         all_results["BS_Test"].append({"bs": bs_test, "history": baseline_history})
-         continue
-    
-    current_config = baseline_config.copy()
-    current_config["bs"] = bs_test
-    print(f"\nTesting BS={bs_test}")
-    history = train_and_eval(current_config["hidden"], current_config["lr"], bs_test, current_config["loss_fn"], epochs=EPOCHS_PER_CONFIG, current_device=device)
-    save_plots(history, current_config, "BS_Test", f"BS_{bs_test}")
-    all_results["BS_Test"].append({ "bs": bs_test, "history": history })
+        current_config = baseline_config.copy()
+        current_config[param_name] = test_value
 
-# --- Test Hidden Layers ---
-print("\n\n--- Testing Hidden Layers (Baseline LR, BS, Loss) ---")
-all_results["HL_Test"] = []
-for hl_test in hidden_configs_to_test:
-    if hl_test == baseline_config["hidden"] and "Baseline" in all_results:
-         print(f"\nSkipping HL={hl_test} (same as baseline)")
-         all_results["HL_Test"].append({"hl": hl_test, "history": baseline_history})
-         continue
+        # Determine varied_str for plot filename/title
+        if param_name == "loss_fn_name": varied_str = f"Loss_{test_value}"
+        elif param_name == "hidden": varied_str = f"HL_{'-'.join(map(str, test_value)) if test_value else '0'}"
+        else: varied_str = f"{param_name.upper()}_{test_value}"
 
-    current_config = baseline_config.copy()
-    current_config["hidden"] = hl_test
-    # Create string representation for saving plots
-    hl_str_test = str(hl_test).replace(' ','').replace('[','').replace(']','').replace(',','-')
-    if hl_str_test == '': hl_str_test = '0'
-    
-    print(f"\nTesting HL={hl_test}")
-    history = train_and_eval(hl_test, current_config["lr"], current_config["bs"], current_config["loss_fn"], epochs=EPOCHS_PER_CONFIG, current_device=device)
-    save_plots(history, current_config, "HL_Test", f"HL_{hl_str_test}")
-    all_results["HL_Test"].append({ "hl": hl_test, "history": history })
+        history = run_experiment(current_config, category_name, varied_str)
+        results_list.append({param_name: test_value, "history": history, "is_baseline": False})
+    return results_list
 
-# --- Test Loss Functions ---
-print("\n\n--- Testing Loss Functions (Baseline LR, BS, HL) ---")
-all_results["LossFn_Test"] = []
-for lf_name_test in loss_fns_to_test:
-    if lf_name_test == baseline_config["loss_fn_name"] and "Baseline" in all_results:
-         print(f"\nSkipping Loss={lf_name_test} (same as baseline)")
-         all_results["LossFn_Test"].append({"loss_fn": lf_name_test, "history": baseline_history})
-         continue
-         
-    current_config = baseline_config.copy()
-    current_config["loss_fn_name"] = lf_name_test
-    current_config["loss_fn"] = loss_fns[lf_name_test] # Get the actual function
-    
-    print(f"\nTesting Loss Function={lf_name_test}")
-    history = train_and_eval(current_config["hidden"], current_config["lr"], current_config["bs"], current_config["loss_fn"], epochs=EPOCHS_PER_CONFIG, current_device=device)
-    save_plots(history, current_config, "LossFn_Test", f"Loss_{lf_name_test}")
-    all_results["LossFn_Test"].append({ "loss_fn": lf_name_test, "history": history })
+# --- Run Parameter Tests ---
+all_results["LR_Test"] = run_test_series("lr", learning_rates_to_test, baseline_config["lr"], "LR")
+all_results["BS_Test"] = run_test_series("bs", batch_sizes_to_test, baseline_config["bs"], "BS")
+all_results["HL_Test"] = run_test_series("hidden", hidden_configs_to_test, baseline_config["hidden"], "HL")
+all_results["LossFn_Test"] = run_test_series("loss_fn_name", loss_fn_names_to_test, baseline_config["loss_fn_name"], "LossFn")
 
 
-# --- 7. Final Summary (Optional Simple Output) ---
+# --- 7. Final Summary ---
 print("\n\n--- Experiment Summary (Final Validation Accuracies) ---")
 
-def print_summary(test_name, results_list, param_name):
-    print(f"\n{test_name} Results:")
-    # Sort results if needed, or print in order tested
-    for r in results_list:
+# Simpler summary print
+baseline_final_acc = all_results["Baseline"]["history"]["val_acc"][-1] if all_results["Baseline"]["history"]["val_acc"] else -1.0
+print(f"Baseline Val Acc: {baseline_final_acc:.2%}")
+
+for category, results in all_results.items():
+    if category == "Baseline": continue # Skip baseline dict itself
+
+    param_key = list(results[0].keys())[0] # Infer parameter name (e.g., 'lr', 'bs')
+    print(f"\n{category} Results:")
+    for r in results:
         final_val_acc = r['history']['val_acc'][-1] if r['history']['val_acc'] else -1.0
-        print(f"  {param_name}={r[param_name]}, Final Val Acc: {final_val_acc:.2%}")
+        prefix = "(Baseline)" if r.get("is_baseline", False) else ""
+        print(f"  {param_key}={r[param_key]} {prefix}, Final Val Acc: {final_val_acc:.2%}")
 
-if "Baseline" in all_results:
-    baseline_val_acc = all_results["Baseline"]["history"]["val_acc"][-1] if all_results["Baseline"]["history"]["val_acc"] else -1.0
-    print(f"Baseline Val Acc: {baseline_val_acc:.2%}")
 
-if "LR_Test" in all_results: print_summary("LR Test", all_results["LR_Test"], "lr")
-if "BS_Test" in all_results: print_summary("BS Test", all_results["BS_Test"], "bs")
-if "HL_Test" in all_results: print_summary("HL Test", all_results["HL_Test"], "hl")
-if "LossFn_Test" in all_results: print_summary("LossFn Test", all_results["LossFn_Test"], "loss_fn")
-
-print("\nFinished. 'plots_one_var_at_a_time' for graphs.")
+print("\nExperiment finished. Check subdirectories inside 'plots_one_var_at_a_time' for detailed graphs.")
