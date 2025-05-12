@@ -213,7 +213,7 @@ loss_fns_to_test = ["CE", "MSE", "MAE"] # Test based on names
 # --- 6. Run Experiments ---
 
 print(f"Running experiments on device: {device}")
-EPOCHS_PER_CONFIG = 5 # Set number of epochs for all runs
+EPOCHS_PER_CONFIG = 10 # Set number of epochs for all runs
 
 # Store results (optional, mainly for programmatic analysis later)
 all_results = {} 
@@ -324,4 +324,4 @@ if "BS_Test" in all_results: print_summary("BS Test", all_results["BS_Test"], "b
 if "HL_Test" in all_results: print_summary("HL Test", all_results["HL_Test"], "hl")
 if "LossFn_Test" in all_results: print_summary("LossFn Test", all_results["LossFn_Test"], "loss_fn")
 
-print("\nExperiment finished. Check subdirectories inside 'plots_one_var_at_a_time' for detailed graphs.")
+print("\nFinished. 'plots_one_var_at_a_time' for graphs.")
