@@ -1,7 +1,6 @@
 # Lab 5: Artificial Neural Networks (Variant 4)
 
 **Author:** Aayush Rautela
-**Course:** Introduction to Artificial Intelligence
 
 ## Description
 
