@@ -23,7 +23,7 @@ Implements a PyTorch Multilayer Perceptron (MLP) for FashionMNIST image classifi
 3.  **Virtual Environment (Recommended):**
     ```bash
     python3 -m venv venv
-    source venv/bin/activate  # Linux/macOS or use equivalent for Windows
+    source venv/bin/activate  # Linux
     ```
 4.  **Install PyTorch:** Install **first** using the official command builder for your system: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/) (Select Pip, Python, CPU/CUDA).
 5.  **Install Other Dependencies:**
